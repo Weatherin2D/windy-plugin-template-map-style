@@ -16,10 +16,13 @@ export const settings: Settings = loadSettings();
 /* Map access                                                          */
 /* ------------------------------------------------------------------ */
 
-/** The MapLibre map inside Windy's LeafletGL map (see LeafletGL docs: "maplibreMap"). */
+/**
+ * Returns the inner MapLibre map from Windy's LeafletGL map.
+ * LeafletGlMap exposes it as .maplibreMap per the official docs.
+ */
 const ml = (): any => {
     const m: any = map;
-    return m?.maplibreMap ?? m?._maplibreMap ?? null;
+    return m?.maplibreMap ?? m?._maplibreMap ?? m?._glMap ?? m?.glMap ?? null;
 };
 
 export interface LayerInfo {
@@ -37,8 +40,7 @@ export function listLayers(): LayerInfo[] {
     }
 }
 
-/* Name-based guesses. They only matter if Windy's base map is made of several layers;
-   the Inspector in the UI lets you assign layers by hand when the guess is wrong. */
+/* Name-based guesses for auto-detection. The Inspector lets you assign layers manually. */
 const WEATHER = /weather|particle|radar|satellite|overlay|isoline|hurricane|airspace|main|mask|poi/i;
 const PATTERNS: [Kind, RegExp][] = [
     ['labels', /label|place|name|city|text/i],
@@ -300,25 +302,39 @@ function rebuildRules() {
     win.__wmsRules = { recolorRules, iconRules };
 }
 
-/** Makes MapLibre request the base map tiles again so the recolour rules take effect. */
+/** Forces MapLibre to re-request base map tiles so recolour rules take effect. */
 function refreshTiles(prefixes: string[]) {
     const m = ml();
     if (!m || !prefixes.length) {
         return;
     }
     try {
-        const sources = m.getStyle?.()?.sources ?? {};
+        const style = m.getStyle?.();
+        if (!style) {
+            return;
+        }
+        const sources = style.sources ?? {};
         for (const id of Object.keys(sources)) {
             const tiles = sourceTiles(id);
             if (!tiles.length || !prefixes.some(p => tiles.some(t => abs(t).startsWith(p)))) {
                 continue;
             }
-            const src = m.getSource(id);
-            if (typeof src?.setTiles === 'function') {
-                const stamp = `_ms=${Date.now()}`;
-                src.setTiles(tiles.map(t => t.replace(/[?&]_ms=\d+/, '') + (t.includes('?') ? '&' : '?') + stamp));
-            } else {
-                m.style?.sourceCaches?.[id]?.clearTiles?.();
+            // Bust the tile cache by appending a timestamp param to each tile URL.
+            const stamp = `_ms=${Date.now()}`;
+            const busted = tiles.map(t => t.replace(/[?&]_ms=\d+/, '') + (t.includes('?') ? '&' : '?') + stamp);
+            try {
+                // MapLibre RasterTileSource exposes setTiles() in some builds, setUrl() in others.
+                const src = m.getSource(id);
+                if (typeof src?.setTiles === 'function') {
+                    src.setTiles(busted);
+                } else if (typeof src?.setUrl === 'function') {
+                    // setUrl takes a single URL, not tiles — skip, use style update instead
+                } else {
+                    // Directly mutate the style source tiles and call triggerRepaint
+                    m.style?.sourceCaches?.[id]?.clearTiles?.();
+                }
+            } catch {
+                /* ignore per-source errors */
             }
         }
         m.triggerRepaint?.();
@@ -337,25 +353,32 @@ const originalPaint = new Map<string, unknown>();
 
 function applyBackground() {
     const b = settings.background;
-    const el: HTMLElement | undefined = (map as any)?.getContainer?.();
+
+    // Apply to the Leaflet container element
+    const el: HTMLElement | null = (map as any)?.getContainer?.() ?? null;
     if (el) {
         if (originalBackground === null) {
             originalBackground = el.style.backgroundColor;
         }
-        el.style.backgroundColor = b.enabled ? b.color : originalBackground;
+        el.style.backgroundColor = b.enabled ? b.color : (originalBackground ?? '');
     }
+
+    // Apply to MapLibre background layers
     try {
         const m = ml();
-        for (const l of listLayers().filter(l => l.type === 'background')) {
-            const key = `${l.id}|background-color`;
-            if (!originalPaint.has(key)) {
-                originalPaint.set(key, m.getPaintProperty(l.id, 'background-color'));
+        if (m) {
+            for (const l of listLayers().filter(l => l.type === 'background')) {
+                const key = `${l.id}|background-color`;
+                if (!originalPaint.has(key)) {
+                    originalPaint.set(key, m.getPaintProperty(l.id, 'background-color'));
+                }
+                m.setPaintProperty(l.id, 'background-color', b.enabled ? b.color : originalPaint.get(key));
             }
-            m.setPaintProperty(l.id, 'background-color', b.enabled ? b.color : originalPaint.get(key));
         }
     } catch {
-        /* no background layer in this build, the container colour still applies */
+        /* no background layer in this style */
     }
+
     const hide = b.enabled && b.hideWindyFill;
     if (hide !== fillHidden) {
         try {
@@ -448,12 +471,44 @@ export function start() {
     } catch {
         /* optional */
     }
-    apply();
-    lastLayerSig = layerSignature();
+
+    const tryApply = () => {
+        apply();
+        lastLayerSig = layerSignature();
+    };
+
+    // If the MapLibre map is not ready yet, wait for it
+    const m = ml();
+    if (!m) {
+        // The LeafletGlMap fires 'load' once the style is ready
+        try {
+            (map as any)?.once?.('load', tryApply);
+        } catch {
+            /* fallback: retry after a short delay */
+            setTimeout(tryApply, 500);
+        }
+    } else {
+        tryApply();
+    }
+
     if (started) {
         return;
     }
     started = true;
+
+    // Listen for style changes on the MapLibre map (via LeafletGlMap's 'load' event,
+    // which fires on each style swap, and also directly on the MapLibre 'styledata' event).
+    try {
+        (map as any)?.on?.('load', () => {
+            const sig = layerSignature();
+            if (sig !== lastLayerSig) {
+                lastLayerSig = sig;
+                apply();
+            }
+        });
+    } catch {
+        /* no style events */
+    }
     try {
         ml()?.on?.('styledata', () => {
             const sig = layerSignature();
@@ -463,7 +518,7 @@ export function start() {
             }
         });
     } catch {
-        /* no style events in this build */
+        /* no styledata event */
     }
 }
 
@@ -511,7 +566,7 @@ export function scan(): ScanResult {
     };
 }
 
-/** Plain-text report you can paste into a chat so the layer guesses can be tuned. */
+/** Plain-text report for debugging — copy via the Inspector button. */
 export function diagnostics(): string {
     const m = ml();
     let sources: unknown = null;
@@ -526,6 +581,7 @@ export function diagnostics(): string {
     return JSON.stringify(
         {
             maplibreFound: !!m,
+            mapObjectKeys: Object.keys((map as any) ?? {}),
             layers: r.layers,
             sources,
             tilePrefixes: r.tilePrefixes.slice(0, 15),
