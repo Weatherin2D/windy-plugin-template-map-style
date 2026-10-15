@@ -1,17 +1,16 @@
 import type { ExternalPluginConfig } from '@windy/interfaces';
 
 const config: ExternalPluginConfig = {
-    name: 'windy-plugin-my-plugin',
+    name: 'windy-plugin-map-style',
     version: '0.1.0',
-    icon: '🔌',
-    title: 'This is my first plugin',
-    description: 'This is my first plugin.',
-    author: 'John Doe (optional company name)',
-    repository: 'https://github.com/windycom/windy-plugin-template',
+    icon: '🎨',
+    title: 'Map style',
+    description:
+        'Change the colour of map outlines, borders, labels and the background, switch each on or off, and swap the lightning, snow and hail icons. Settings are saved in your browser.',
+    author: 'Your name',
     desktopUI: 'rhpane',
     mobileUI: 'fullscreen',
-    routerPath: '/my-plugin',
-    private: true,
+    routerPath: '/map-style',
 };
 
 export default config;
