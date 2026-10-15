@@ -4,7 +4,7 @@ import type { IconKind, InkTarget, Kind, Settings } from './settings';
 
 export type { IconKind, Kind, Settings };
 
-const W = window as any;
+const win = window as any;
 
 export const KINDS: Kind[] = ['outlines', 'borders', 'labels'];
 export const ICONS: IconKind[] = ['lightning', 'snow', 'hail'];
@@ -215,23 +215,23 @@ function buildIconBlob(origFetch: typeof fetch, url: string, dataUrl: string): P
 /* ------------------------------------------------------------------ */
 
 function installInterceptors() {
-    if (!W.__wmsOrigFetch) {
-        W.__wmsOrigFetch = W.fetch.bind(W);
-        W.fetch = async function (input: any, init?: any) {
+    if (!win.__wmsOrigFetch) {
+        win.__wmsOrigFetch = win.fetch.bind(win);
+        win.fetch = async function (input: any, init?: any) {
             try {
-                const rules = W.__wmsRules;
+                const rules = win.__wmsRules;
                 const raw: string = typeof input === 'string' ? input : input?.url ?? '';
                 if (rules && raw && !raw.startsWith('data:') && !raw.startsWith('blob:')) {
                     const url = abs(raw);
                     const bare = url.split('?')[0];
                     const icon = (rules.iconRules as IconRule[]).find(r => r.url === bare);
                     if (icon) {
-                        const blob = await buildIconBlob(W.__wmsOrigFetch, url, icon.dataUrl);
+                        const blob = await buildIconBlob(win.__wmsOrigFetch, url, icon.dataUrl);
                         return new Response(blob, { status: 200, headers: { 'Content-Type': 'image/png' } });
                     }
                     const rule = (rules.recolorRules as RecolorRule[]).find(r => url.startsWith(r.prefix));
                     if (rule) {
-                        const res = await W.__wmsOrigFetch(input, init);
+                        const res = await win.__wmsOrigFetch(input, init);
                         if (!res.ok) {
                             return res;
                         }
@@ -242,26 +242,26 @@ function installInterceptors() {
             } catch {
                 /* fall through to the untouched request */
             }
-            return W.__wmsOrigFetch(input, init);
+            return win.__wmsOrigFetch(input, init);
         };
     }
 
     const proto = HTMLImageElement.prototype;
     const desc = Object.getOwnPropertyDescriptor(proto, 'src');
-    if (desc?.set && !W.__wmsImgPatched) {
-        W.__wmsImgPatched = true;
+    if (desc?.set && !win.__wmsImgPatched) {
+        win.__wmsImgPatched = true;
         Object.defineProperty(proto, 'src', {
             configurable: true,
             enumerable: desc.enumerable,
             get: desc.get,
             set(this: HTMLImageElement, value: string) {
                 try {
-                    const rules = W.__wmsRules;
+                    const rules = win.__wmsRules;
                     if (rules && typeof value === 'string' && value && !value.startsWith('data:')) {
                         const url = abs(value);
                         const icon = (rules.iconRules as IconRule[]).find(r => r.url === url.split('?')[0]);
                         if (icon) {
-                            buildIconBlob(W.__wmsOrigFetch, url, icon.dataUrl)
+                            buildIconBlob(win.__wmsOrigFetch, url, icon.dataUrl)
                                 .then(blobToDataUrl)
                                 .then(du => desc.set!.call(this, du))
                                 .catch(() => desc.set!.call(this, value));
@@ -297,7 +297,7 @@ function rebuildRules() {
         url: abs(settings.icons[i].textureUrl).split('?')[0],
         dataUrl: settings.icons[i].dataUrl as string,
     }));
-    W.__wmsRules = { recolorRules, iconRules };
+    win.__wmsRules = { recolorRules, iconRules };
 }
 
 /** Makes MapLibre request the base map tiles again so the recolour rules take effect. */
