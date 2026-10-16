@@ -10,6 +10,8 @@ export interface KindStyle {
     color: string;
     /** Which pixels of a baked (raster) tile get the new colour. */
     ink: InkTarget;
+    /** Line thickness multiplier: 1 = original, 2 = dilate 1px, 3 = dilate 2px, etc. */
+    thickness: number;
     /** Manual list of map layer ids. Empty means "auto-detect by name". */
     layerIds: string[];
     /** Manual tile URL prefix (everything before /z/x/y). Empty means "read it from the layer's source". */
@@ -38,6 +40,7 @@ const kind = (color: string, ink: InkTarget): KindStyle => ({
     recolor: false,
     color,
     ink,
+    thickness: 1,
     layerIds: [],
     tilePrefix: '',
 });

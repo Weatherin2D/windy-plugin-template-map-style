@@ -17,7 +17,7 @@ export const settings: Settings = loadSettings();
 /* ------------------------------------------------------------------ */
 
 /**
- * Returns the MapLibre map instance.
+ * Returns the inner MapLibre map instance.
  * Diagnostics confirmed the property is _maplibreMap (with underscore).
  */
 const ml = (): any => {
@@ -41,7 +41,6 @@ export function listLayers(): LayerInfo[] {
     }
 }
 
-/* Name-based guesses for auto-detection. The Inspector lets you assign layers manually. */
 const WEATHER = /weather|particle|radar|satellite|overlay|isoline|hurricane|airspace|main|mask|poi/i;
 const PATTERNS: [Kind, RegExp][] = [
     ['labels', /label|place|name|city|text/i],
@@ -50,13 +49,9 @@ const PATTERNS: [Kind, RegExp][] = [
 ];
 
 function classify(id: string): Kind | null {
-    if (WEATHER.test(id)) {
-        return null;
-    }
+    if (WEATHER.test(id)) return null;
     for (const [kind, re] of PATTERNS) {
-        if (re.test(id)) {
-            return kind;
-        }
+        if (re.test(id)) return kind;
     }
     return null;
 }
@@ -91,33 +86,26 @@ const prefixOf = (template: string): string => {
 };
 
 /**
- * Known Windy raster tile prefixes, used as fallback when MapLibre layer
- * enumeration returns nothing (which happens with Windy's LeafletGL setup).
+ * Windy serves all map content as raster PNG tiles from these two origins.
+ * darkmap/grayland = outlines + borders baked together.
+ * labels = place name text tiles.
  */
-const WINDY_TILE_DEFAULTS: Record<Kind, string> = {
-    outlines: 'https://tiles.windy.com/tiles/',   // darkmap tiles contain outlines + borders
-    borders:  'https://tiles.windy.com/tiles/',   // same source as outlines
-    labels:   'https://tiles.windy.com/labels/',  // separate label tiles
+const WINDY_PREFIXES: Record<Kind, string[]> = {
+    outlines: ['https://tiles.windy.com/tiles/'],
+    borders:  ['https://tiles.windy.com/tiles/'],
+    labels:   ['https://tiles.windy.com/labels/'],
 };
 
 export function effectivePrefix(kind: Kind): string {
     const k = settings.kinds[kind];
-    if (k.tilePrefix) {
-        return abs(k.tilePrefix);
-    }
+    if (k.tilePrefix) return abs(k.tilePrefix);
     for (const layer of resolveLayers(kind)) {
-        if (layer.type !== 'raster') {
-            continue;
-        }
+        if (layer.type !== 'raster') continue;
         const t = sourceTiles(layer.source)[0];
         const p = t ? prefixOf(t) : '';
-        if (p) {
-            return p;
-        }
+        if (p) return p;
     }
-    // Fall back to known Windy tile prefixes so recolouring works even when
-    // MapLibre layer enumeration returns empty (Windy's LeafletGL wrapping).
-    return WINDY_TILE_DEFAULTS[kind];
+    return WINDY_PREFIXES[kind][0];
 }
 
 /* ------------------------------------------------------------------ */
@@ -135,9 +123,7 @@ function dataUrlToBlob(dataUrl: string): Blob {
     const mime = /data:([^;]+)/.exec(head)?.[1] ?? 'image/png';
     const bin = atob(body);
     const bytes = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) {
-        bytes[i] = bin.charCodeAt(i);
-    }
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
     return new Blob([bytes], { type: mime });
 }
 
@@ -150,7 +136,6 @@ function blobToDataUrl(blob: Blob): Promise<string> {
     });
 }
 
-/** Downscales a picked file so it fits comfortably in browser storage. */
 export async function fileToIcon(file: File, max = 256): Promise<string> {
     const bmp = await createImageBitmap(file);
     const scale = Math.min(1, max / Math.max(bmp.width, bmp.height));
@@ -162,28 +147,65 @@ export async function fileToIcon(file: File, max = 256): Promise<string> {
 }
 
 interface RecolorRule {
-    prefix: string;
+    prefixes: string[];   // all URL prefixes this rule applies to
     color: [number, number, number];
     ink: InkTarget;
+    thickness: number;    // 1 = no change, 2+ = dilate by (thickness-1) pixels
 }
 interface IconRule {
     url: string;
     dataUrl: string;
 }
 
-/** Keeps the alpha channel, replaces the colour of the pixels the rule targets. */
+/**
+ * Recolours a tile blob. If thickness > 1, performs a morphological dilation
+ * pass first to thicken the lines, then recolours.
+ */
 async function recolorBlob(blob: Blob, rule: RecolorRule): Promise<Blob> {
     const bmp = await createImageBitmap(blob);
-    const canvas = new OffscreenCanvas(bmp.width, bmp.height);
+    const w = bmp.width;
+    const h = bmp.height;
+    const canvas = new OffscreenCanvas(w, h);
     const g = canvas.getContext('2d')!;
     g.drawImage(bmp, 0, 0);
-    const img = g.getImageData(0, 0, canvas.width, canvas.height);
+    let img = g.getImageData(0, 0, w, h);
+
+    // Dilation pass — expand non-transparent pixels outward
+    const dilate = Math.max(0, Math.round(rule.thickness) - 1);
+    if (dilate > 0) {
+        const src = new Uint8ClampedArray(img.data);
+        const dst = img.data;
+        for (let y = 0; y < h; y++) {
+            for (let x = 0; x < w; x++) {
+                const idx = (y * w + x) * 4;
+                if (src[idx + 3] > 0) continue; // already opaque, skip
+                // Check if any neighbour within dilate radius is non-transparent
+                outer: for (let dy = -dilate; dy <= dilate; dy++) {
+                    for (let dx = -dilate; dx <= dilate; dx++) {
+                        const nx = x + dx;
+                        const ny = y + dy;
+                        if (nx < 0 || nx >= w || ny < 0 || ny >= h) continue;
+                        const nidx = (ny * w + nx) * 4;
+                        if (src[nidx + 3] > 0) {
+                            // Copy neighbour alpha to expand the line
+                            dst[idx] = src[nidx];
+                            dst[idx + 1] = src[nidx + 1];
+                            dst[idx + 2] = src[nidx + 2];
+                            dst[idx + 3] = src[nidx + 3];
+                            break outer;
+                        }
+                    }
+                }
+            }
+        }
+        img = g.getImageData(0, 0, w, h); // re-read after dilation
+    }
+
+    // Recolour pass
     const d = img.data;
     const [r, gr, b] = rule.color;
     for (let i = 0; i < d.length; i += 4) {
-        if (d[i + 3] === 0) {
-            continue;
-        }
+        if (d[i + 3] === 0) continue;
         const lum = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
         if (rule.ink === 'all' || (rule.ink === 'dark' && lum < 128) || (rule.ink === 'light' && lum >= 128)) {
             d[i] = r;
@@ -197,25 +219,20 @@ async function recolorBlob(blob: Blob, rule: RecolorRule): Promise<Blob> {
 
 const iconCache = new Map<string, Promise<Blob>>();
 
-/** Draws the user's image at the size of the original texture, so texture coordinates stay valid. */
 function buildIconBlob(origFetch: typeof fetch, url: string, dataUrl: string): Promise<Blob> {
     const key = `${url}|${dataUrl.length}|${dataUrl.slice(-48)}`;
     let p = iconCache.get(key);
     if (!p) {
         p = (async () => {
             const user = await createImageBitmap(dataUrlToBlob(dataUrl));
-            let w = user.width;
-            let h = user.height;
+            let w = user.width, h = user.height;
             try {
                 const res = await origFetch(url);
                 if (res.ok) {
                     const o = await createImageBitmap(await res.blob());
-                    w = o.width;
-                    h = o.height;
+                    w = o.width; h = o.height;
                 }
-            } catch {
-                /* keep the user's own size */
-            }
+            } catch { /* keep user size */ }
             const c = new OffscreenCanvas(w, h);
             c.getContext('2d')!.drawImage(user, 0, 0, w, h);
             return c.convertToBlob({ type: 'image/png' });
@@ -226,41 +243,95 @@ function buildIconBlob(origFetch: typeof fetch, url: string, dataUrl: string): P
 }
 
 /* ------------------------------------------------------------------ */
-/* Network interception (installed once per page, rules swapped live)  */
+/* Network interception                                                */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Finds the recolor rule for a given URL by checking all prefixes.
+ * Returns null if no rule matches.
+ */
+function findRule(url: string): RecolorRule | null {
+    const rules: RecolorRule[] = win.__wmsRules?.recolorRules ?? [];
+    return rules.find(r => r.prefixes.some(p => url.startsWith(p))) ?? null;
+}
+
 function installInterceptors() {
+    // ----- fetch interceptor -----
     if (!win.__wmsOrigFetch) {
         win.__wmsOrigFetch = win.fetch.bind(win);
         win.fetch = async function (input: any, init?: any) {
             try {
-                const rules = win.__wmsRules;
                 const raw: string = typeof input === 'string' ? input : input?.url ?? '';
-                if (rules && raw && !raw.startsWith('data:') && !raw.startsWith('blob:')) {
+                if (raw && !raw.startsWith('data:') && !raw.startsWith('blob:')) {
                     const url = abs(raw);
                     const bare = url.split('?')[0];
-                    const icon = (rules.iconRules as IconRule[]).find(r => r.url === bare);
+                    const iconRules: IconRule[] = win.__wmsRules?.iconRules ?? [];
+                    const icon = iconRules.find(r => r.url === bare);
                     if (icon) {
                         const blob = await buildIconBlob(win.__wmsOrigFetch, url, icon.dataUrl);
                         return new Response(blob, { status: 200, headers: { 'Content-Type': 'image/png' } });
                     }
-                    const rule = (rules.recolorRules as RecolorRule[]).find(r => url.startsWith(r.prefix));
+                    const rule = findRule(url);
                     if (rule) {
                         const res = await win.__wmsOrigFetch(input, init);
-                        if (!res.ok) {
-                            return res;
-                        }
+                        if (!res.ok) return res;
                         const out = await recolorBlob(await res.clone().blob(), rule);
                         return new Response(out, { status: 200, headers: { 'Content-Type': 'image/png' } });
                     }
                 }
-            } catch {
-                /* fall through to the untouched request */
-            }
+            } catch { /* fall through */ }
             return win.__wmsOrigFetch(input, init);
         };
     }
 
+    // ----- XMLHttpRequest interceptor (Windy's tile loader uses XHR) -----
+    if (!win.__wmsXhrPatched) {
+        win.__wmsXhrPatched = true;
+        const OrigXHR = win.XMLHttpRequest;
+        win.XMLHttpRequest = function () {
+            const xhr = new OrigXHR();
+            let _url = '';
+            let _rule: RecolorRule | null = null;
+
+            const origOpen = xhr.open.bind(xhr);
+            xhr.open = function (method: string, url: string, ...rest: any[]) {
+                _url = abs(String(url));
+                _rule = findRule(_url);
+                return origOpen(method, url, ...rest);
+            };
+
+            const origSend = xhr.send.bind(xhr);
+            xhr.send = function (...args: any[]) {
+                if (!_rule) return origSend(...args);
+
+                // Intercept the response by listening for load, then replacing responseType data
+                xhr.addEventListener('load', async () => {
+                    try {
+                        if (xhr.status < 200 || xhr.status >= 300) return;
+                        const blob = xhr.response instanceof Blob
+                            ? xhr.response
+                            : new Blob([xhr.response]);
+                        const out = await recolorBlob(blob, _rule!);
+                        // Patch the response properties
+                        const du = await blobToDataUrl(out);
+                        Object.defineProperty(xhr, 'response', { get: () => out });
+                        Object.defineProperty(xhr, 'responseURL', { get: () => du });
+                    } catch { /* leave response unchanged */ }
+                }, { once: true });
+
+                // Need binary response to get a Blob
+                try { xhr.responseType = 'blob'; } catch { /* ignore */ }
+                return origSend(...args);
+            };
+
+            return xhr;
+        };
+        // Copy static properties
+        Object.setPrototypeOf(win.XMLHttpRequest, OrigXHR);
+        win.XMLHttpRequest.prototype = OrigXHR.prototype;
+    }
+
+    // ----- HTMLImageElement.src interceptor -----
     const proto = HTMLImageElement.prototype;
     const desc = Object.getOwnPropertyDescriptor(proto, 'src');
     if (desc?.set && !win.__wmsImgPatched) {
@@ -271,10 +342,10 @@ function installInterceptors() {
             get: desc.get,
             set(this: HTMLImageElement, value: string) {
                 try {
-                    const rules = win.__wmsRules;
-                    if (rules && typeof value === 'string' && value && !value.startsWith('data:')) {
+                    if (typeof value === 'string' && value && !value.startsWith('data:')) {
                         const url = abs(value);
-                        const icon = (rules.iconRules as IconRule[]).find(r => r.url === url.split('?')[0]);
+                        const iconRules: IconRule[] = win.__wmsRules?.iconRules ?? [];
+                        const icon = iconRules.find(r => r.url === url.split('?')[0]);
                         if (icon) {
                             buildIconBlob(win.__wmsOrigFetch, url, icon.dataUrl)
                                 .then(blobToDataUrl)
@@ -283,9 +354,7 @@ function installInterceptors() {
                             return;
                         }
                     }
-                } catch {
-                    /* use the original value */
-                }
+                } catch { /* use original */ }
                 desc.set!.call(this, value);
             },
         });
@@ -298,48 +367,67 @@ let lastRuleSig = '';
 
 function rebuildRules() {
     recolorRules = [];
+
+    // Build one rule per unique prefix group, keeping separate rules for
+    // outlines/borders (same tile source) vs labels (different tile source).
+    // We allow duplicate prefixes across rules — the first match wins in findRule().
     for (const kind of KINDS) {
         const k = settings.kinds[kind];
-        if (!k.touched || !k.recolor) {
-            continue;
-        }
-        const prefix = effectivePrefix(kind);
-        if (prefix && !recolorRules.some(r => r.prefix === prefix)) {
-            recolorRules.push({ prefix, color: hexToRgb(k.color), ink: k.ink });
-        }
+        if (!k.touched || !k.recolor) continue;
+
+        const manualPrefix = k.tilePrefix ? abs(k.tilePrefix) : '';
+        const prefixes = manualPrefix
+            ? [manualPrefix]
+            : WINDY_PREFIXES[kind];
+
+        recolorRules.push({
+            prefixes,
+            color: hexToRgb(k.color),
+            ink: k.ink,
+            thickness: k.thickness ?? 1,
+        });
     }
-    iconRules = ICONS.filter(i => settings.icons[i].dataUrl && settings.icons[i].textureUrl).map(i => ({
-        url: abs(settings.icons[i].textureUrl).split('?')[0],
-        dataUrl: settings.icons[i].dataUrl as string,
-    }));
+
+    iconRules = ICONS
+        .filter(i => settings.icons[i].dataUrl && settings.icons[i].textureUrl)
+        .map(i => ({
+            url: abs(settings.icons[i].textureUrl).split('?')[0],
+            dataUrl: settings.icons[i].dataUrl as string,
+        }));
+
     win.__wmsRules = { recolorRules, iconRules };
 }
 
-/** Forces MapLibre to re-request base map tiles so recolour rules take effect. */
-function refreshTiles(prefixes: string[]) {
-    const m = ml();
-    if (!m || !prefixes.length) {
-        return;
-    }
+/**
+ * Forces tile reload by clearing Windy's tile caches.
+ * Since ml().getStyle() returns empty, we walk the LeafletGL layer tree instead.
+ */
+function forceRefreshTiles() {
     try {
-        const sources = m.getStyle?.()?.sources ?? {};
-        for (const id of Object.keys(sources)) {
-            const tiles = sourceTiles(id);
-            if (!tiles.length || !prefixes.some(p => tiles.some(t => abs(t).startsWith(p)))) {
-                continue;
-            }
-            const src = m.getSource(id);
-            if (typeof src?.setTiles === 'function') {
-                const stamp = `_ms=${Date.now()}`;
-                src.setTiles(tiles.map(t => t.replace(/[?&]_ms=\d+/, '') + (t.includes('?') ? '&' : '?') + stamp));
-            } else {
-                m.style?.sourceCaches?.[id]?.clearTiles?.();
+        // Try MapLibre source cache clear
+        const m = ml();
+        if (m) {
+            const style = m.getStyle?.();
+            if (style?.sources) {
+                for (const id of Object.keys(style.sources)) {
+                    m.style?.sourceCaches?.[id]?.clearTiles?.();
+                }
+                m.triggerRepaint?.();
             }
         }
-        m.triggerRepaint?.();
-    } catch {
-        /* the Inspector will show whether tiles reloaded */
-    }
+    } catch { /* ignore */ }
+
+    try {
+        // Walk Windy's LeafletGL layers and call redraw on tile layers
+        const lmap: any = map;
+        lmap?._layers && Object.values(lmap._layers).forEach((layer: any) => {
+            try {
+                layer?.redraw?.();
+                layer?._reset?.();
+                layer?._update?.();
+            } catch { /* ignore */ }
+        });
+    } catch { /* ignore */ }
 }
 
 /* ------------------------------------------------------------------ */
@@ -352,40 +440,24 @@ const originalPaint = new Map<string, unknown>();
 
 function applyBackground() {
     const b = settings.background;
-
-    // Apply background colour to the map container element
     const el: HTMLElement | null = (map as any)?.getContainer?.() ?? null;
     if (el) {
-        if (originalBackground === null) {
-            originalBackground = el.style.backgroundColor;
-        }
+        if (originalBackground === null) originalBackground = el.style.backgroundColor;
         el.style.backgroundColor = b.enabled ? b.color : (originalBackground ?? '');
     }
-
-    // Also set MapLibre background layer colour
     try {
         const m = ml();
         if (m) {
             for (const l of listLayers().filter(l => l.type === 'background')) {
                 const key = `${l.id}|background-color`;
-                if (!originalPaint.has(key)) {
-                    originalPaint.set(key, m.getPaintProperty(l.id, 'background-color'));
-                }
+                if (!originalPaint.has(key)) originalPaint.set(key, m.getPaintProperty(l.id, 'background-color'));
                 m.setPaintProperty(l.id, 'background-color', b.enabled ? b.color : originalPaint.get(key));
             }
         }
-    } catch {
-        /* no background layer in this style */
-    }
-
+    } catch { /* no background layer */ }
     const hide = b.enabled && b.hideWindyFill;
     if (hide !== fillHidden) {
-        try {
-            toggleLandSeaMaskColored(!hide);
-            fillHidden = hide;
-        } catch {
-            /* not available */
-        }
+        try { toggleLandSeaMaskColored(!hide); fillHidden = hide; } catch { /* ignore */ }
     }
 }
 
@@ -398,53 +470,38 @@ const PAINT_PROPS: Record<string, string[]> = {
 
 function applyKind(kind: Kind) {
     const k = settings.kinds[kind];
-    if (!k.touched) {
-        return;
-    }
+    if (!k.touched) return;
     const m = ml();
-    if (!m) {
-        return;
-    }
+    if (!m) return;
     for (const layer of resolveLayers(kind)) {
-        try {
-            m.setLayoutProperty(layer.id, 'visibility', k.visible ? 'visible' : 'none');
-        } catch {
-            /* layer vanished */
-        }
+        try { m.setLayoutProperty(layer.id, 'visibility', k.visible ? 'visible' : 'none'); } catch { /* ignore */ }
         for (const prop of PAINT_PROPS[layer.type] ?? []) {
             const key = `${layer.id}|${prop}`;
             try {
-                if (!originalPaint.has(key)) {
-                    originalPaint.set(key, m.getPaintProperty(layer.id, prop));
-                }
+                if (!originalPaint.has(key)) originalPaint.set(key, m.getPaintProperty(layer.id, prop));
                 m.setPaintProperty(layer.id, prop, k.recolor ? k.color : originalPaint.get(key));
-            } catch {
-                /* property not supported by this layer */
-            }
+            } catch { /* ignore */ }
         }
     }
 }
 
 function layerSignature(): string {
-    return listLayers()
-        .map(l => l.id)
-        .join('|');
+    return listLayers().map(l => l.id).join('|');
 }
 
 export function apply() {
-    const before = recolorRules.map(r => r.prefix);
+    const prevSig = JSON.stringify(recolorRules);
     rebuildRules();
     installInterceptors();
     applyBackground();
     KINDS.forEach(applyKind);
-    const sig = JSON.stringify(recolorRules);
-    if (sig !== lastRuleSig) {
-        lastRuleSig = sig;
-        refreshTiles([...new Set([...before, ...recolorRules.map(r => r.prefix)])]);
+    const newSig = JSON.stringify(recolorRules);
+    if (newSig !== lastRuleSig || newSig !== prevSig) {
+        lastRuleSig = newSig;
+        forceRefreshTiles();
     }
 }
 
-/** Saves, then applies. Returns false if the browser would not store the settings. */
 export function commit(): boolean {
     const ok = saveSettings(settings);
     apply();
@@ -463,48 +520,24 @@ export function resetAll() {
 let started = false;
 let lastLayerSig = '';
 
-/** Safe to call every time the plugin opens. Effects stay in place after it closes. */
 export function start() {
-    try {
-        performance.setResourceTimingBufferSize?.(2000);
-    } catch {
-        /* optional */
-    }
-
+    try { performance.setResourceTimingBufferSize?.(2000); } catch { /* ignore */ }
     apply();
     lastLayerSig = layerSignature();
-
-    if (started) {
-        return;
-    }
+    if (started) return;
     started = true;
-
-    // Re-apply whenever the map style changes (base map switch, zoom-level style swap, etc.)
-    // LeafletGlMap fires 'load' on each full style load/reload.
     try {
         (map as any)?.on?.('load', () => {
             const sig = layerSignature();
-            if (sig !== lastLayerSig) {
-                lastLayerSig = sig;
-                apply();
-            }
+            if (sig !== lastLayerSig) { lastLayerSig = sig; apply(); }
         });
-    } catch {
-        /* ignore */
-    }
-
-    // Also listen for MapLibre's styledata event on the inner map object.
+    } catch { /* ignore */ }
     try {
         ml()?.on?.('styledata', () => {
             const sig = layerSignature();
-            if (sig !== lastLayerSig) {
-                lastLayerSig = sig;
-                apply();
-            }
+            if (sig !== lastLayerSig) { lastLayerSig = sig; apply(); }
         });
-    } catch {
-        /* ignore */
-    }
+    } catch { /* ignore */ }
 }
 
 /* ------------------------------------------------------------------ */
@@ -532,9 +565,7 @@ export function scan(): ScanResult {
     const entries = performance.getEntriesByType('resource') as PerformanceResourceTiming[];
     for (const e of entries) {
         const bare = e.name.split('?')[0];
-        if (bare.startsWith('data:') || bare.startsWith('blob:')) {
-            continue;
-        }
+        if (bare.startsWith('data:') || bare.startsWith('blob:')) continue;
         if (TILE_TAIL.test(bare)) {
             const prefix = bare.replace(TILE_TAIL, '/');
             prefixes.set(prefix, (prefixes.get(prefix) ?? 0) + 1);
@@ -545,36 +576,27 @@ export function scan(): ScanResult {
     return {
         layers,
         tilePrefixes: [...prefixes].map(([prefix, count]) => ({ prefix, count })).sort((a, b) => b.count - a.count),
-        images: [...images]
-            .map(([url, hint]) => ({ url, hint }))
-            .sort((a, b) => Number(!!b.hint) - Number(!!a.hint)),
+        images: [...images].map(([url, hint]) => ({ url, hint })).sort((a, b) => Number(!!b.hint) - Number(!!a.hint)),
     };
 }
 
-/** Plain-text report for debugging — copy via the Inspector button. */
 export function diagnostics(): string {
     const m = ml();
     let sources: unknown = null;
     try {
         const s = m?.getStyle?.()?.sources ?? {};
         sources = Object.keys(s).map(id => ({ id, type: s[id].type, tiles: s[id].tiles }));
-    } catch {
-        /* ignore */
-    }
+    } catch { /* ignore */ }
     const r = scan();
     const slim = JSON.parse(JSON.stringify(settings, (key, value) => (key === 'dataUrl' && value ? '[image]' : value)));
-    return JSON.stringify(
-        {
-            maplibreFound: !!m,
-            mapObjectKeys: Object.keys((map as any) ?? {}),
-            layers: r.layers,
-            sources,
-            tilePrefixes: r.tilePrefixes.slice(0, 15),
-            imageHints: r.images.filter(i => i.hint),
-            otherImages: r.images.filter(i => !i.hint).slice(0, 25),
-            settings: slim,
-        },
-        null,
-        2,
-    );
+    return JSON.stringify({
+        maplibreFound: !!m,
+        mapObjectKeys: Object.keys((map as any) ?? {}),
+        layers: r.layers,
+        sources,
+        tilePrefixes: r.tilePrefixes.slice(0, 15),
+        imageHints: r.images.filter(i => i.hint),
+        otherImages: r.images.filter(i => !i.hint).slice(0, 25),
+        settings: slim,
+    }, null, 2);
 }

@@ -41,19 +41,27 @@
                     aria-label="{kindLabels[kind]} colour"
                 />
                 <select bind:value={s.kinds[kind].ink} on:change={() => changed(kind)} aria-label="Pixels to recolour">
-                    <option value="all">All lines</option>
+                    <option value="all">All pixels</option>
                     <option value="dark">Dark parts</option>
                     <option value="light">Light parts</option>
                 </select>
             </div>
+            <div class="row tight">
+                <label class="grow" for="thickness-{kind}">Line thickness: {s.kinds[kind].thickness ?? 1}×</label>
+                <input
+                    id="thickness-{kind}"
+                    type="range"
+                    min="1"
+                    max="5"
+                    step="1"
+                    bind:value={s.kinds[kind].thickness}
+                    on:change={() => changed(kind)}
+                    aria-label="{kindLabels[kind]} thickness"
+                    class="slider"
+                />
+            </div>
         </div>
     {/each}
-    {#if sharedSource}
-        <small class="note">
-            These share one baked map image, so they also share one colour and one on/off switch. Use the Inspector
-            below to see what Windy exposes.
-        </small>
-    {/if}
 
     <h3>Weather icons</h3>
     {#each ICONS as icon}
@@ -173,7 +181,6 @@
     let diagText = '';
     let scanResult: ScanResult | null = null;
     let layerInfo: Record<Kind, string> = { outlines: '', borders: '', labels: '' };
-    let sharedSource = false;
 
     const kindLabels: Record<Kind, string> = {
         outlines: 'Land and water outlines',
@@ -187,22 +194,19 @@
     const shortUrl = (u: string) => u.replace(/^https?:\/\//, '').replace(/^www\./, '');
 
     function refreshInfo() {
-        const prefixes: string[] = [];
         for (const k of KINDS) {
             const n = resolveLayers(k).length;
             const p = effectivePrefix(k);
-            if (p) {
-                prefixes.push(p);
-            }
             layerInfo[k] = n ? `${n} layer${n > 1 ? 's' : ''}` : p ? 'image source found' : 'not found yet';
         }
         layerInfo = layerInfo;
-        sharedSource = prefixes.length > 1 && new Set(prefixes).size < prefixes.length;
     }
 
     function changed(kind?: Kind) {
         if (kind) {
             s.kinds[kind].touched = true;
+            // ensure thickness has a value (handles old saved settings without thickness)
+            if (s.kinds[kind].thickness == null) s.kinds[kind].thickness = 1;
         }
         s = s;
         status = commit() ? 'Saved' : 'Could not save: browser storage is full or blocked';
@@ -212,9 +216,7 @@
     async function pickIcon(e: Event, icon: IconKind) {
         const input = e.target as HTMLInputElement;
         const file = input.files?.[0];
-        if (!file) {
-            return;
-        }
+        if (!file) return;
         try {
             s.icons[icon].dataUrl = await fileToIcon(file);
             changed();
@@ -353,6 +355,10 @@
         border: 1px solid rgba(128, 128, 128, 0.5);
         border-radius: 6px;
         background: none;
+    }
+    .slider {
+        width: 100px;
+        cursor: pointer;
     }
     select {
         max-width: 110px;
