@@ -17,17 +17,13 @@ export const settings: Settings = loadSettings();
 /* ------------------------------------------------------------------ */
 
 /**
- * Returns the MapLibre-compatible map object.
- *
- * `map` from @windy/map is a LeafletGlMap. Per the official LeafletGL docs,
- * the inner MapLibre instance is at `.maplibreMap`. However, LeafletGlMap also
- * proxies all the MapLibre methods (getStyle, setPaintProperty, setLayoutProperty,
- * getSource, on, triggerRepaint…) directly, so we fall back to using it as-is.
+ * Returns the MapLibre map instance.
+ * Diagnostics confirmed the property is _maplibreMap (with underscore).
  */
 const ml = (): any => {
     const m: any = map;
     if (!m) return null;
-    return m.maplibreMap ?? m._maplibreMap ?? m;
+    return m._maplibreMap ?? m.maplibreMap ?? m;
 };
 
 export interface LayerInfo {
@@ -94,6 +90,16 @@ const prefixOf = (template: string): string => {
     return i > 0 ? abs(template.slice(0, i)) : '';
 };
 
+/**
+ * Known Windy raster tile prefixes, used as fallback when MapLibre layer
+ * enumeration returns nothing (which happens with Windy's LeafletGL setup).
+ */
+const WINDY_TILE_DEFAULTS: Record<Kind, string> = {
+    outlines: 'https://tiles.windy.com/tiles/',   // darkmap tiles contain outlines + borders
+    borders:  'https://tiles.windy.com/tiles/',   // same source as outlines
+    labels:   'https://tiles.windy.com/labels/',  // separate label tiles
+};
+
 export function effectivePrefix(kind: Kind): string {
     const k = settings.kinds[kind];
     if (k.tilePrefix) {
@@ -109,7 +115,9 @@ export function effectivePrefix(kind: Kind): string {
             return p;
         }
     }
-    return '';
+    // Fall back to known Windy tile prefixes so recolouring works even when
+    // MapLibre layer enumeration returns empty (Windy's LeafletGL wrapping).
+    return WINDY_TILE_DEFAULTS[kind];
 }
 
 /* ------------------------------------------------------------------ */
