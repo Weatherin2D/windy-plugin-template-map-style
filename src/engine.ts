@@ -17,12 +17,17 @@ export const settings: Settings = loadSettings();
 /* ------------------------------------------------------------------ */
 
 /**
- * Returns the inner MapLibre map from Windy's LeafletGL map.
- * LeafletGlMap exposes it as .maplibreMap per the official docs.
+ * Returns the MapLibre-compatible map object.
+ *
+ * `map` from @windy/map is a LeafletGlMap. Per the official LeafletGL docs,
+ * the inner MapLibre instance is at `.maplibreMap`. However, LeafletGlMap also
+ * proxies all the MapLibre methods (getStyle, setPaintProperty, setLayoutProperty,
+ * getSource, on, triggerRepaint…) directly, so we fall back to using it as-is.
  */
 const ml = (): any => {
     const m: any = map;
-    return m?.maplibreMap ?? m?._maplibreMap ?? m?._glMap ?? m?.glMap ?? null;
+    if (!m) return null;
+    return m.maplibreMap ?? m._maplibreMap ?? m;
 };
 
 export interface LayerInfo {
@@ -309,32 +314,18 @@ function refreshTiles(prefixes: string[]) {
         return;
     }
     try {
-        const style = m.getStyle?.();
-        if (!style) {
-            return;
-        }
-        const sources = style.sources ?? {};
+        const sources = m.getStyle?.()?.sources ?? {};
         for (const id of Object.keys(sources)) {
             const tiles = sourceTiles(id);
             if (!tiles.length || !prefixes.some(p => tiles.some(t => abs(t).startsWith(p)))) {
                 continue;
             }
-            // Bust the tile cache by appending a timestamp param to each tile URL.
-            const stamp = `_ms=${Date.now()}`;
-            const busted = tiles.map(t => t.replace(/[?&]_ms=\d+/, '') + (t.includes('?') ? '&' : '?') + stamp);
-            try {
-                // MapLibre RasterTileSource exposes setTiles() in some builds, setUrl() in others.
-                const src = m.getSource(id);
-                if (typeof src?.setTiles === 'function') {
-                    src.setTiles(busted);
-                } else if (typeof src?.setUrl === 'function') {
-                    // setUrl takes a single URL, not tiles — skip, use style update instead
-                } else {
-                    // Directly mutate the style source tiles and call triggerRepaint
-                    m.style?.sourceCaches?.[id]?.clearTiles?.();
-                }
-            } catch {
-                /* ignore per-source errors */
+            const src = m.getSource(id);
+            if (typeof src?.setTiles === 'function') {
+                const stamp = `_ms=${Date.now()}`;
+                src.setTiles(tiles.map(t => t.replace(/[?&]_ms=\d+/, '') + (t.includes('?') ? '&' : '?') + stamp));
+            } else {
+                m.style?.sourceCaches?.[id]?.clearTiles?.();
             }
         }
         m.triggerRepaint?.();
@@ -354,7 +345,7 @@ const originalPaint = new Map<string, unknown>();
 function applyBackground() {
     const b = settings.background;
 
-    // Apply to the Leaflet container element
+    // Apply background colour to the map container element
     const el: HTMLElement | null = (map as any)?.getContainer?.() ?? null;
     if (el) {
         if (originalBackground === null) {
@@ -363,7 +354,7 @@ function applyBackground() {
         el.style.backgroundColor = b.enabled ? b.color : (originalBackground ?? '');
     }
 
-    // Apply to MapLibre background layers
+    // Also set MapLibre background layer colour
     try {
         const m = ml();
         if (m) {
@@ -472,32 +463,16 @@ export function start() {
         /* optional */
     }
 
-    const tryApply = () => {
-        apply();
-        lastLayerSig = layerSignature();
-    };
-
-    // If the MapLibre map is not ready yet, wait for it
-    const m = ml();
-    if (!m) {
-        // The LeafletGlMap fires 'load' once the style is ready
-        try {
-            (map as any)?.once?.('load', tryApply);
-        } catch {
-            /* fallback: retry after a short delay */
-            setTimeout(tryApply, 500);
-        }
-    } else {
-        tryApply();
-    }
+    apply();
+    lastLayerSig = layerSignature();
 
     if (started) {
         return;
     }
     started = true;
 
-    // Listen for style changes on the MapLibre map (via LeafletGlMap's 'load' event,
-    // which fires on each style swap, and also directly on the MapLibre 'styledata' event).
+    // Re-apply whenever the map style changes (base map switch, zoom-level style swap, etc.)
+    // LeafletGlMap fires 'load' on each full style load/reload.
     try {
         (map as any)?.on?.('load', () => {
             const sig = layerSignature();
@@ -507,8 +482,10 @@ export function start() {
             }
         });
     } catch {
-        /* no style events */
+        /* ignore */
     }
+
+    // Also listen for MapLibre's styledata event on the inner map object.
     try {
         ml()?.on?.('styledata', () => {
             const sig = layerSignature();
@@ -518,7 +495,7 @@ export function start() {
             }
         });
     } catch {
-        /* no styledata event */
+        /* ignore */
     }
 }
 
