@@ -261,12 +261,14 @@ function installInterceptors() {
         win.__wmsOrigFetch = win.fetch.bind(win);
         win.fetch = async function (input: any, init?: any) {
             try {
-                const raw: string = typeof input === 'string' ? input : input?.url ?? '';
+                const raw: string = typeof input === 'string' ? input
+                    : (input instanceof Request) ? input.url
+                    : input?.url ?? '';
                 if (raw && !raw.startsWith('data:') && !raw.startsWith('blob:')) {
                     const url = abs(raw);
                     const bare = url.split('?')[0];
-                    const iconRules: IconRule[] = win.__wmsRules?.iconRules ?? [];
-                    const icon = iconRules.find(r => r.url === bare);
+                    const iRules: IconRule[] = win.__wmsRules?.iconRules ?? [];
+                    const icon = iRules.find(r => r.url === bare);
                     if (icon) {
                         const blob = await buildIconBlob(win.__wmsOrigFetch, url, icon.dataUrl);
                         return new Response(blob, { status: 200, headers: { 'Content-Type': 'image/png' } });
@@ -284,70 +286,39 @@ function installInterceptors() {
         };
     }
 
-    // ----- XMLHttpRequest interceptor (Windy's tile loader uses XHR) -----
-    if (!win.__wmsXhrPatched) {
-        win.__wmsXhrPatched = true;
-        const OrigXHR = win.XMLHttpRequest;
-        win.XMLHttpRequest = function () {
-            const xhr = new OrigXHR();
-            let _url = '';
-            let _rule: RecolorRule | null = null;
-
-            const origOpen = xhr.open.bind(xhr);
-            xhr.open = function (method: string, url: string, ...rest: any[]) {
-                _url = abs(String(url));
-                _rule = findRule(_url);
-                return origOpen(method, url, ...rest);
-            };
-
-            const origSend = xhr.send.bind(xhr);
-            xhr.send = function (...args: any[]) {
-                if (!_rule) return origSend(...args);
-
-                // Intercept the response by listening for load, then replacing responseType data
-                xhr.addEventListener('load', async () => {
-                    try {
-                        if (xhr.status < 200 || xhr.status >= 300) return;
-                        const blob = xhr.response instanceof Blob
-                            ? xhr.response
-                            : new Blob([xhr.response]);
-                        const out = await recolorBlob(blob, _rule!);
-                        // Patch the response properties
-                        const du = await blobToDataUrl(out);
-                        Object.defineProperty(xhr, 'response', { get: () => out });
-                        Object.defineProperty(xhr, 'responseURL', { get: () => du });
-                    } catch { /* leave response unchanged */ }
-                }, { once: true });
-
-                // Need binary response to get a Blob
-                try { xhr.responseType = 'blob'; } catch { /* ignore */ }
-                return origSend(...args);
-            };
-
-            return xhr;
-        };
-        // Copy static properties
-        Object.setPrototypeOf(win.XMLHttpRequest, OrigXHR);
-        win.XMLHttpRequest.prototype = OrigXHR.prototype;
-    }
-
-    // ----- HTMLImageElement.src interceptor -----
+    // ----- HTMLImageElement.src interceptor (Windy loads raster tiles via img.src) -----
     const proto = HTMLImageElement.prototype;
     const desc = Object.getOwnPropertyDescriptor(proto, 'src');
-    if (desc?.set && !win.__wmsImgPatched) {
-        win.__wmsImgPatched = true;
+    // Use a version stamp so we reinstall when the interceptor logic changes
+    if (desc?.set && win.__wmsImgPatched !== 2) {
+        win.__wmsImgPatched = 2;
         Object.defineProperty(proto, 'src', {
             configurable: true,
             enumerable: desc.enumerable,
             get: desc.get,
             set(this: HTMLImageElement, value: string) {
                 try {
-                    if (typeof value === 'string' && value && !value.startsWith('data:')) {
+                    if (typeof value === 'string' && value && !value.startsWith('data:') && !value.startsWith('blob:')) {
                         const url = abs(value);
-                        const iconRules: IconRule[] = win.__wmsRules?.iconRules ?? [];
-                        const icon = iconRules.find(r => r.url === url.split('?')[0]);
+                        const bare = url.split('?')[0];
+
+                        // Icon swap
+                        const iRules: IconRule[] = win.__wmsRules?.iconRules ?? [];
+                        const icon = iRules.find(r => r.url === bare);
                         if (icon) {
                             buildIconBlob(win.__wmsOrigFetch, url, icon.dataUrl)
+                                .then(blobToDataUrl)
+                                .then(du => desc.set!.call(this, du))
+                                .catch(() => desc.set!.call(this, value));
+                            return;
+                        }
+
+                        // Tile recolour
+                        const rule = findRule(url);
+                        if (rule) {
+                            (win.__wmsOrigFetch(url) as Promise<Response>)
+                                .then(res => res.ok ? res.blob() : Promise.reject())
+                                .then(blob => recolorBlob(blob, rule))
                                 .then(blobToDataUrl)
                                 .then(du => desc.set!.call(this, du))
                                 .catch(() => desc.set!.call(this, value));

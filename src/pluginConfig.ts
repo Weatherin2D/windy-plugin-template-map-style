@@ -2,7 +2,7 @@ import type { ExternalPluginConfig } from '@windy/interfaces';
 
 const config: ExternalPluginConfig = {
     name: 'windy-plugin-map-style',
-    version: '0.1.4',
+    version: '0.1.5',
     private: false,
     icon: '🎨',
     title: 'Map style',
